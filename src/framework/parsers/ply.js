@@ -461,6 +461,161 @@ const readPly = async (reader, propertyFilter = null) => {
     return new GSplatData(elements);
 };
 
+/**
+ * asynchronously read a ply file data
+ *
+ * @param {ReadableStreamDefaultReader<Uint8Array>} reader - The reader.
+ * @param {Function|null} propertyFilter - Function to filter properties with.
+ * @returns {Promise<GSplatData | GSplatCompressedData>} The ply file data.
+ */
+const readPlyOld = async (reader, propertyFilter = null) => {
+    /**
+     * Searches for the first occurrence of a sequence within a buffer.
+     * @example
+     * find(new Uint8Array([1, 2, 3, 4]), new Uint8Array([3, 4])); // 2
+     * @param {Uint8Array} buf - The buffer in which to search.
+     * @param {Uint8Array} search - The sequence to search for.
+     * @returns {number} The index of the first occurrence of the search sequence in the buffer, or -1 if not found.
+     */
+    const find = (buf, search) => {
+        const endIndex = buf.length - search.length;
+        let i, j;
+        for (i = 0; i <= endIndex; ++i) {
+            for (j = 0; j < search.length; ++j) {
+                if (buf[i + j] !== search[j]) {
+                    break;
+                }
+            }
+            if (j === search.length) {
+                return i;
+            }
+        }
+        return -1;
+    };
+
+    /**
+     * Checks if array 'a' starts with the same elements as array 'b'.
+     * @example
+     * startsWith(new Uint8Array([1, 2, 3, 4]), new Uint8Array([1, 2])); // true
+     * @param {Uint8Array} a - The array to check against.
+     * @param {Uint8Array} b - The array of elements to look for at the start of 'a'.
+     * @returns {boolean} - True if 'a' starts with all elements of 'b', otherwise false.
+     */
+    const startsWith = (a, b) => {
+        if (a.length < b.length) {
+            return false;
+        }
+
+        for (let i = 0; i < b.length; ++i) {
+            if (a[i] !== b[i]) {
+                return false;
+            }
+        }
+
+        return true;
+    };
+
+    const streamBuf = new StreamBuf(reader);
+    let headerLength;
+
+    while (true) {
+        // get the next chunk of data
+        /* eslint-disable no-await-in-loop */
+        await streamBuf.read();
+
+        // check magic bytes
+        if (streamBuf.tail >= magicBytes.length && !startsWith(streamBuf.data, magicBytes)) {
+            throw new Error('Invalid ply header');
+        }
+
+        // search for end-of-header marker
+        headerLength = find(streamBuf.data, endHeaderBytes);
+
+        if (headerLength !== -1) {
+            break;
+        }
+    }
+
+    // decode buffer header text and split into lines and remove comments
+    const lines = new TextDecoder('ascii')
+    .decode(streamBuf.data.subarray(0, headerLength))
+    .split('\n')
+    .filter(line => !line.startsWith('comment '));
+
+    // decode header and build element and property list
+    const { elements, format } = parseHeader(lines);
+
+    // check format is supported
+    if (format !== 'binary_little_endian' && format !== 'binary_big_endian') {
+        throw new Error('Unsupported ply format');
+    }
+
+    // skip past header and compact the chunk data so the read operations
+    // fall nicely on aligned data boundaries
+    streamBuf.head = headerLength + endHeaderBytes.length;
+    streamBuf.compact();
+
+    // load compressed PLY with fast path
+    if (isCompressedPly(elements)) {
+        return await readCompressedPly(streamBuf, elements, format === 'binary_little_endian');
+    }
+
+    // allocate element storage
+    elements.forEach((e) => {
+        e.properties.forEach((p) => {
+            const storageType = dataTypeMap.get(p.type);
+            if (storageType) {
+                const storage = (!propertyFilter || propertyFilter(p.name)) ? new storageType(e.count) : null;
+                p.storage = storage;
+            }
+        });
+    });
+
+    // read and un-interleave the data
+    for (let i = 0; i < elements.length; ++i) {
+        const element = elements[i];
+
+        // calculate the size of an input element record
+        const inputSize = element.properties.reduce((a, p) => a + p.byteSize, 0);
+        let c = 0;
+
+        while (c < element.count) {
+            while (streamBuf.remaining < inputSize) {
+                /* eslint-disable no-await-in-loop */
+                await streamBuf.read();
+            }
+
+            const toRead = Math.min(element.count - c, Math.floor(streamBuf.remaining / inputSize));
+
+            for (let n = 0; n < toRead; ++n) {
+                for (let j = 0; j < element.properties.length; ++j) {
+                    const property = element.properties[j];
+
+                    if (property.storage) {
+                        switch (property.type) {
+                            case 'char':   property.storage[c] = streamBuf.getInt8(); break;
+                            case 'uchar':  property.storage[c] = streamBuf.getUint8(); break;
+                            case 'short':  property.storage[c] = streamBuf.getInt16(); break;
+                            case 'ushort': property.storage[c] = streamBuf.getUint16(); break;
+                            case 'int':    property.storage[c] = streamBuf.getInt32(); break;
+                            case 'uint':   property.storage[c] = streamBuf.getUint32(); break;
+                            case 'float':  property.storage[c] = streamBuf.getFloat32(); break;
+                            case 'double': property.storage[c] = streamBuf.getFloat64(); break;
+                        }
+                    } else {
+                        streamBuf.head += property.byteSize;
+                    }
+                }
+                c++;
+            }
+        }
+    }
+
+    // console.log(elements);
+
+    return new GSplatData(elements);
+};
+
 // filter out element data we're not going to use
 const defaultElements = [
     'x', 'y', 'z',
@@ -554,4 +709,4 @@ class PlyParser {
     }
 }
 
-export { PlyParser };
+export { PlyParser, readPly, readPlyOld };
